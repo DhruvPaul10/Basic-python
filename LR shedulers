@@ -1,0 +1,309 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+
+# Assuming df is already loaded with your data
+# For this example, let's create a simple synthetic dataset if df is not defined
+try:
+    # Check if df exists in the current scope
+    df
+except NameError:
+    # Create synthetic data if df doesn't exist
+    np.random.seed(42)
+    X = np.random.randn(1000, 10)
+    y = (X[:, 0] > 0).astype(float)
+    df = pd.DataFrame(np.column_stack([X, y]), 
+                     columns=[f'feature_{i}' for i in range(10)] + ['target'])
+
+# Prepare data
+X = df.iloc[:, :-1].values  # All columns except the last one
+y = df.iloc[:, -1]          # Last column as target
+
+# Split the data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Scale features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# Convert to PyTorch tensors
+X_train = torch.tensor(X_train, dtype=torch.float32)
+X_test = torch.tensor(X_test, dtype=torch.float32)
+
+# Convert target to appropriate format
+try:
+    y_train = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+    y_test = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+except AttributeError:
+    # If y_train is not a pandas Series with a .values attribute
+    y_train = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+    y_test = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+
+# Create DataLoader
+train_dataset = TensorDataset(X_train, y_train)
+test_dataset = TensorDataset(X_test, y_test)
+train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(dataset=test_dataset, batch_size=32, shuffle=False)
+
+# Define functional ANN model
+class ANN(nn.Module):
+    def __init__(self, input_size, hidden_size=32, output_size=1):
+        super(ANN, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        # No activation in the output layer (we'll use BCEWithLogitsLoss)
+        x = self.fc2(x)
+        return x
+
+# Define sequential ANN model
+def create_sequential_model(input_size, hidden_size=32, output_size=1):
+    model = nn.Sequential(
+        nn.Linear(input_size, hidden_size),
+        nn.ReLU(),
+        nn.Linear(hidden_size, output_size)
+    )
+    return model
+
+# Function to train model with different learning rate schedulers
+def train_with_scheduler(model, train_loader, scheduler_type='none', epochs=100, 
+                        lr=0.01, plot_lr=True, verbose=True):
+    # Initialize optimizer
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # Initialize loss function (BCEWithLogitsLoss combines sigmoid and BCE for numerical stability)
+    criterion = nn.BCEWithLogitsLoss()
+    
+    # Initialize the appropriate scheduler
+    scheduler = None
+    if scheduler_type == 'step':
+        # Step LR: decays the learning rate by gamma every step_size epochs
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    elif scheduler_type == 'multistep':
+        # MultiStepLR: decays the learning rate at specific milestones by gamma
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 40, 75], gamma=0.5)
+    elif scheduler_type == 'exponential':
+        # ExponentialLR: decays the learning rate exponentially by gamma each epoch 
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    elif scheduler_type == 'cosine':
+        # CosineAnnealingLR: reduces learning rate following a cosine curve
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif scheduler_type == 'reduce_on_plateau':
+        # ReduceLROnPlateau: reduces learning rate when a metric plateaus
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, 
+                                                        patience=5, verbose=verbose)
+    elif scheduler_type == 'one_cycle':
+        # OneCycleLR: implements the 1cycle policy
+        total_steps = epochs * len(train_loader)
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr*10, 
+                                                total_steps=total_steps)
+    elif scheduler_type == 'cyclic':
+        # CyclicLR: cycles the learning rate between two boundaries
+        scheduler = optim.lr_scheduler.CyclicLR(optimizer, base_lr=lr/10, max_lr=lr,
+                                             step_size_up=5*len(train_loader), mode='triangular2')
+    elif scheduler_type == 'cosine_restart':
+        # CosineAnnealingWarmRestarts: cosine annealing with restarts
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    
+    # Keep track of losses and learning rates for plotting
+    losses = []
+    learning_rates = []
+    
+    # Training loop
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        
+        for inputs, labels in train_loader:
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Update learning rates for schedulers that update per batch
+            if scheduler_type in ['one_cycle', 'cyclic']:
+                scheduler.step()
+                
+            running_loss += loss.item()
+            
+        epoch_loss = running_loss / len(train_loader)
+        losses.append(epoch_loss)
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        learning_rates.append(current_lr)
+        
+        # Update learning rate scheduler (those that update per epoch)
+        if scheduler is not None:
+            if scheduler_type == 'reduce_on_plateau':
+                scheduler.step(epoch_loss)
+            elif scheduler_type not in ['one_cycle', 'cyclic']:
+                scheduler.step()
+        
+        # Print epoch results
+        if verbose and (epoch+1) % 10 == 0:
+            print(f'Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}, LR: {current_lr:.6f}')
+    
+    # Plot learning rate over epochs if requested
+    if plot_lr and scheduler is not None:
+        plt.figure(figsize=(10, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(learning_rates)
+        plt.title(f'Learning Rate - {scheduler_type}')
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(losses)
+        plt.title('Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        
+        plt.tight_layout()
+        plt.show()
+        
+    return model, losses, learning_rates
+
+# Function to evaluate model
+def evaluate_model(model, test_loader):
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            # Get raw logits
+            outputs = model(inputs)
+            # Apply sigmoid to convert to probabilities
+            predicted_probs = torch.sigmoid(outputs)
+            # Convert probabilities to binary predictions
+            predicted = (predicted_probs > 0.5).float()
+            
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f'Accuracy on test data: {accuracy:.2f}%')
+    return accuracy
+
+# Initialize input size from data
+input_size = X_train.shape[1]
+
+# Demo: Train models with different schedulers
+schedulers_to_try = [
+    'none',              # No scheduler (constant learning rate)
+    'step',              # StepLR
+    'multistep',         # MultiStepLR 
+    'exponential',       # ExponentialLR
+    'cosine',            # CosineAnnealingLR
+    'reduce_on_plateau', # ReduceLROnPlateau
+    'one_cycle',         # OneCycleLR
+    'cyclic',            # CyclicLR
+    'cosine_restart'     # CosineAnnealingWarmRestarts
+]
+
+# Function to compare all schedulers
+def compare_schedulers(schedulers=schedulers_to_try, epochs=50):
+    results = {}
+    
+    for scheduler_type in schedulers:
+        print(f"\n--- Training with {scheduler_type} scheduler ---")
+        
+        # Create a fresh model
+        model = ANN(input_size)
+        
+        # Train with the scheduler
+        model, losses, lrs = train_with_scheduler(
+            model, 
+            train_loader, 
+            scheduler_type=scheduler_type,
+            epochs=epochs,
+            plot_lr=False,  # Don't plot each one individually
+            verbose=False
+        )
+        
+        # Evaluate
+        accuracy = evaluate_model(model, test_loader)
+        
+        # Store results
+        results[scheduler_type] = {
+            'model': model,
+            'losses': losses,
+            'learning_rates': lrs,
+            'accuracy': accuracy
+        }
+    
+    # Plot comparison of all learning rate schedules
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(2, 1, 1)
+    for name, data in results.items():
+        plt.plot(data['learning_rates'], label=name)
+    plt.title('Learning Rate Schedules')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.legend()
+    
+    plt.subplot(2, 1, 2)
+    for name, data in results.items():
+        plt.plot(data['losses'], label=f"{name} (Acc: {data['accuracy']:.1f}%)")
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return results
+
+# Usage example:
+# results = compare_schedulers(epochs=50)
+
+# Example usage of a specific scheduler
+print("\nTraining with ReduceLROnPlateau scheduler:")
+model = ANN(input_size)
+model, losses, lrs = train_with_scheduler(
+    model, 
+    train_loader, 
+    scheduler_type='reduce_on_plateau',
+    epochs=100,
+    lr=0.01,
+    plot_lr=True
+)
+
+# Evaluate the model
+print("\nEvaluating final model:")
+accuracy = evaluate_model(model, test_loader)
+
+# Example of using a scheduler with the Sequential API model
+print("\nTraining Sequential model with OneCycleLR scheduler:")
+seq_model = create_sequential_model(input_size)
+seq_model, seq_losses, seq_lrs = train_with_scheduler(
+    seq_model, 
+    train_loader, 
+    scheduler_type='one_cycle',
+    epochs=100,
+    lr=0.01,
+    plot_lr=True
+)
+
+# Evaluate the sequential model
+print("\nEvaluating Sequential model:")
+seq_accuracy = evaluate_model(seq_model, test_loader)
+
+# To compare all schedulers, uncomment the following line:
+# results = compare_schedulers(epochs=50)
